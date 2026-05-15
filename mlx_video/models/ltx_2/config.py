@@ -154,14 +154,6 @@ class LTXModelConfig(BaseModelConfig):
         if self.audio_positional_embedding_max_pos is None:
             self.audio_positional_embedding_max_pos = [20]
 
-        # PyTorch LTX-2 configurator reads "frequencies_precision" (not
-        # "double_precision_rope") from the config.  For LTX-2 (no prompt adaln)
-        # the key is absent, so double_precision_rope = False.  For LTX-2.3
-        # (has_prompt_adaln=True) the safetensors config has
-        # frequencies_precision="float64", so double_precision_rope = True.
-        if not self.has_prompt_adaln:
-            self.double_precision_rope = False
-
         # Convert string enum values if loading from dict
         if isinstance(self.model_type, str):
             self.model_type = LTXModelType(self.model_type)

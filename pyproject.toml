@@ -15,7 +15,7 @@ dependencies = [
     "numpy",
     "safetensors",
     "huggingface_hub",
-    "transformers[tokenizers]",
+    "transformers",
     "tqdm",
     "opencv-python>=4.12.0.88",
     "Pillow>=10.3.0",

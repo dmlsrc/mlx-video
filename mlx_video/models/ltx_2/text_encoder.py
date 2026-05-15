@@ -21,8 +21,12 @@ from rich.progress import (
 
 from mlx_video.utils import apply_quantization, rms_norm
 
+GEMMA_REPO_ID = "google/gemma-3-12b-it"
+
 # Path to system prompts
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+from mlx_video.models.ltx_2.checkpoint import find_cached_hf_snapshot as _find_cached_hf_snapshot
 
 
 def _load_system_prompt(prompt_name: str) -> str:
@@ -830,10 +834,24 @@ class LTX2TextEncoder(nn.Module):
     def load(
         self,
         model_path: Optional[str] = None,
-        text_encoder_path: Optional[str] = "google/gemma-3-12b-it",
+        text_encoder_path: Optional[str] = None,
     ):
-
-        if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
+        # Resolve text encoder path in priority order:
+        # 1. Explicit path given by caller
+        # 2. text_encoder/ subdir inside the MLX model directory
+        # 3. Local HF hub cache for google/gemma-3-12b-it
+        if text_encoder_path is None:
+            model_te = Path(str(model_path)) / "text_encoder" if model_path else None
+            if model_te and model_te.is_dir():
+                text_encoder_path = str(model_te)
+            else:
+                text_encoder_path = _find_cached_hf_snapshot(GEMMA_REPO_ID)
+                if text_encoder_path is None:
+                    raise FileNotFoundError(
+                        f"No text encoder found. Provide text_encoder_path or cache "
+                        f"{GEMMA_REPO_ID} locally via `hf download {GEMMA_REPO_ID}`."
+                    )
+        elif Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
 
         self.language_model = LanguageModel.from_pretrained(text_encoder_path)
@@ -877,20 +895,17 @@ class LTX2TextEncoder(nn.Module):
         # Load tokenizer
         from transformers import AutoTokenizer
 
-        tokenizer_path = model_path / "tokenizer"
-        if tokenizer_path.exists():
+        tokenizer_path = Path(str(model_path)) / "tokenizer" if model_path else None
+        if tokenizer_path and tokenizer_path.exists():
             self.processor = AutoTokenizer.from_pretrained(
                 str(tokenizer_path), trust_remote_code=True
             )
         else:
-            try:
-                self.processor = AutoTokenizer.from_pretrained(
-                    text_encoder_path, trust_remote_code=True
-                )
-            except Exception:
-                self.processor = AutoTokenizer.from_pretrained(
-                    "google/gemma-3-12b-it", trust_remote_code=True
-                )
+            # Try the resolved text_encoder_path, then fall back to hub cache
+            tokenizer_source = text_encoder_path or _find_cached_hf_snapshot(GEMMA_REPO_ID) or GEMMA_REPO_ID
+            self.processor = AutoTokenizer.from_pretrained(
+                tokenizer_source, trust_remote_code=True
+            )
         # Set left padding to match official LTX-2 text encoder
         self.processor.padding_side = "left"
 

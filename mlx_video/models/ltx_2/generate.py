@@ -5,6 +5,7 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 
 import argparse
 import math
+import re
 import time
 from enum import Enum
 from pathlib import Path
@@ -421,13 +422,9 @@ def create_position_grid(
     # Divide temporal coords by fps
     pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] / fps
 
-    # Cast entire position grid through bfloat16 to match PyTorch's behavior.
-    # PyTorch does: positions = positions.to(bfloat16) on ALL coordinates before
-    # passing to the transformer/RoPE. This quantization is what the model was
-    # trained with, so we must replicate it for numerical fidelity.
-    positions_bf16 = mx.array(pixel_coords, dtype=mx.bfloat16)
-    mx.eval(positions_bf16)
-    return positions_bf16.astype(mx.float32)
+    # Keep video RoPE positions in fp32. Downcasting through bfloat16 quantizes
+    # the position values and degrades video quality.
+    return mx.array(pixel_coords, dtype=mx.float32)
 
 
 def create_audio_position_grid(
@@ -454,10 +451,9 @@ def create_audio_position_grid(
     positions = positions[np.newaxis, np.newaxis, :, :]
     positions = np.tile(positions, (batch_size, 1, 1, 1))
 
-    # Cast through bfloat16 to match PyTorch's precision behavior
-    positions_bf16 = mx.array(positions, dtype=mx.bfloat16)
-    mx.eval(positions_bf16)
-    return positions_bf16.astype(mx.float32)
+    # Keep audio RoPE positions in fp32 — bf16 quantizes timestamps badly on longer clips
+    # and smears speech timing.
+    return mx.array(positions, dtype=mx.float32)
 
 
 def compute_audio_frames(num_video_frames: int, fps: float) -> int:
@@ -1894,9 +1890,17 @@ def generate_video(
             elif "x2" in str(upscaler_path):
                 upscaler_scale = 2.0
         else:
-            # Auto-detect: prefer x2 upscaler
+            # Auto-detect: prefer x2 upscaler, newest version first
+            def _upscaler_version_key(p: Path):
+                m = re.search(r"-(\d+(?:\.\d+)+)\.safetensors$", p.name)
+                if m:
+                    return tuple(int(x) for x in m.group(1).split("."))
+                return (0,)
+
             upscaler_files = sorted(
-                model_path.glob("*spatial-upscaler-x2*.safetensors")
+                model_path.glob("*spatial-upscaler-x2*.safetensors"),
+                key=_upscaler_version_key,
+                reverse=True,
             )
             if upscaler_files:
                 upscaler_path = upscaler_files[0]
@@ -2168,6 +2172,7 @@ def generate_video(
             )
             latents = state1.latent
             mx.eval(latents)
+            del noise
         else:
             latents = mx.random.normal(
                 (1, 128, latent_frames, stage1_h, stage1_w), dtype=model_dtype
@@ -2197,26 +2202,36 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
+            # Load VAE decoder only to extract per-channel statistics for
+            # upsampler normalization, then immediately evict it — keeping it
+            # resident through Stage 2 wastes ~800MB for no reason.
+            _vae_stats = VideoDecoder.from_pretrained(
                 str(model_path / "vae" / "decoder")
             )
+            _stats_mean = _vae_stats.per_channel_statistics.mean
+            _stats_std = _vae_stats.per_channel_statistics.std
+            mx.eval(_stats_mean, _stats_std)
+            del _vae_stats
+            mx.clear_cache()
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                _stats_mean,
+                _stats_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, _stats_mean, _stats_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
 
-        # Stage 2
+        # Stage 2 — clear cache once more before allocating full-res tensors
+        mx.clear_cache()
         console.print(
             f"\n[bold yellow]⚡ Stage 2:[/] Refining at {stage2_w*32}x{stage2_h*32} (3 steps)"
         )
+        del positions  # free Stage 1 position grid before allocating Stage 2
         positions = create_position_grid(1, latent_frames, stage2_h, stage2_w)
         mx.eval(positions)
 
@@ -2244,12 +2259,14 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del noise
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+            del noise
 
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
         if audio_latents is not None and not is_a2v:
@@ -2259,6 +2276,7 @@ def generate_video(
                 mx.array(1.0, dtype=model_dtype) - audio_noise_scale
             )
             mx.eval(audio_latents)
+            del audio_noise
 
         # Joint video + audio refinement (no CFG, positive embeddings only)
         latents, audio_latents = denoise_distilled(
@@ -2358,6 +2376,7 @@ def generate_video(
             )
             latents = video_state.latent
             mx.eval(latents)
+            del noise
         else:
             latents = mx.random.normal(video_latent_shape, dtype=model_dtype)
             mx.eval(latents)
@@ -2388,9 +2407,6 @@ def generate_video(
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
         )
-
-        # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
-        vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
 
     elif pipeline == PipelineType.DEV_TWO_STAGE:
         # ======================================================================
@@ -2489,6 +2505,7 @@ def generate_video(
             )
             latents = state1.latent
             mx.eval(latents)
+            del noise
         else:
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
@@ -2531,19 +2548,24 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
+            _vae_stats = VideoDecoder.from_pretrained(
                 str(model_path / "vae" / "decoder")
             )
+            _stats_mean = _vae_stats.per_channel_statistics.mean
+            _stats_std = _vae_stats.per_channel_statistics.std
+            mx.eval(_stats_mean, _stats_std)
+            del _vae_stats
+            mx.clear_cache()
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                _stats_mean,
+                _stats_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, _stats_mean, _stats_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
 
@@ -2598,12 +2620,14 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del noise
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+            del noise
 
         # Re-noise audio at sigma=0.909375 for joint refinement (matches PyTorch)
         if audio_latents is not None and not is_a2v:
@@ -2613,6 +2637,7 @@ def generate_video(
                 mx.array(1.0, dtype=model_dtype) - audio_noise_scale
             )
             mx.eval(audio_latents)
+            del audio_noise
 
         # Joint video + audio refinement (no CFG, positive embeddings only)
         latents, audio_latents = denoise_distilled(
@@ -2764,6 +2789,7 @@ def generate_video(
             )
             latents = state1.latent
             mx.eval(latents)
+            del noise
         else:
             latents = mx.random.normal(stage1_shape, dtype=model_dtype)
             mx.eval(latents)
@@ -2805,19 +2831,24 @@ def generate_video(
             upsampler, upscaler_scale = load_upsampler(str(upscaler_path))
             mx.eval(upsampler.parameters())
 
-            vae_decoder = VideoDecoder.from_pretrained(
+            _vae_stats = VideoDecoder.from_pretrained(
                 str(model_path / "vae" / "decoder")
             )
+            _stats_mean = _vae_stats.per_channel_statistics.mean
+            _stats_std = _vae_stats.per_channel_statistics.std
+            mx.eval(_stats_mean, _stats_std)
+            del _vae_stats
+            mx.clear_cache()
 
             latents = upsample_latents(
                 latents,
                 upsampler,
-                vae_decoder.per_channel_statistics.mean,
-                vae_decoder.per_channel_statistics.std,
+                _stats_mean,
+                _stats_std,
             )
             mx.eval(latents)
 
-            del upsampler
+            del upsampler, _stats_mean, _stats_std
             mx.clear_cache()
         console.print("[green]✓[/] Latents upsampled")
 
@@ -2864,12 +2895,14 @@ def generate_video(
             )
             latents = state2.latent
             mx.eval(latents)
+            del noise
         else:
             noise_scale = mx.array(STAGE_2_SIGMAS[0], dtype=model_dtype)
             one_minus_scale = mx.array(1.0 - STAGE_2_SIGMAS[0], dtype=model_dtype)
             noise = mx.random.normal(latents.shape).astype(model_dtype)
             latents = noise * noise_scale + latents * one_minus_scale
             mx.eval(latents)
+            del noise
 
         # Re-noise audio at sigma=0.909375 for joint refinement
         if audio_latents is not None and not is_a2v:
@@ -2879,6 +2912,7 @@ def generate_video(
                 mx.array(1.0, dtype=model_dtype) - audio_noise_scale
             )
             mx.eval(audio_latents)
+            del audio_noise
 
         # Stage 2: res_2s with no CFG (positive embeddings only)
         stage2_sigmas = mx.array(STAGE_2_SIGMAS, dtype=mx.float32)
@@ -2910,6 +2944,9 @@ def generate_video(
     # ==========================================================================
 
     console.print("\n[blue]🎞️  Decoding video...[/]")
+
+    vae_decoder = VideoDecoder.from_pretrained(str(model_path / "vae" / "decoder"))
+    mx.eval(vae_decoder.parameters())
 
     # Select tiling configuration
     if tiling == "none":

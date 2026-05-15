@@ -18,27 +18,27 @@ They share the same model architecture — the difference is in the inference pi
 
 ### Step 1: Download Weights
 
-Download the original PyTorch checkpoints from HuggingFace using the `huggingface-cli` tool (install with `pip install huggingface_hub`):
+Download the original PyTorch checkpoints from HuggingFace using the `hf` CLI:
 
 **Wan2.1**
 ```bash
 # Text-to-Video 1.3B (fast, fits in ~4 GB)
-huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./Wan2.1-T2V-1.3B
+hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./Wan2.1-T2V-1.3B
 
 # Text-to-Video 14B
-huggingface-cli download Wan-AI/Wan2.1-T2V-14B --local-dir ./Wan2.1-T2V-14B
+hf download Wan-AI/Wan2.1-T2V-14B --local-dir ./Wan2.1-T2V-14B
 ```
 
 **Wan2.2**
 ```bash
 # Text-to-Video 14B
-huggingface-cli download Wan-AI/Wan2.2-T2V-A14B --local-dir ./Wan2.2-T2V-A14B
+hf download Wan-AI/Wan2.2-T2V-A14B --local-dir ./Wan2.2-T2V-A14B
 
 # Image-to-Video 14B
-huggingface-cli download Wan-AI/Wan2.2-I2V-A14B --local-dir ./Wan2.2-I2V-A14B
+hf download Wan-AI/Wan2.2-I2V-A14B --local-dir ./Wan2.2-I2V-A14B
 
 # Text+Image-to-Video 5B (uses a different VAE — z_dim=48)
-huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --local-dir ./Wan2.2-TI2V-5B
+hf download Wan-AI/Wan2.2-TI2V-5B --local-dir ./Wan2.2-TI2V-5B
 ```
 
 Each downloaded directory will have this structure:

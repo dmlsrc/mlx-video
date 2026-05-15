@@ -223,15 +223,9 @@ class BasicAVTransformerBlock(nn.Module):
             slice(None, None),
         )
 
-        # Squeeze the sequence dimension if it's 1
-        scale_shift_squeezed = tuple(
-            mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in scale_shift_ada
-        )
-        gate_squeezed = tuple(
-            mx.squeeze(t, axis=1) if t.shape[1] == 1 else t for t in gate_ada
-        )
-
-        return (*scale_shift_squeezed, *gate_squeezed)
+        # Keep (B, 1, D) shape — matches reference/Diffusers behavior and
+        # avoids implicit broadcasting when batch size > 1.
+        return (*scale_shift_ada, *gate_ada)
 
     def __call__(
         self,

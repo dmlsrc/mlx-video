@@ -29,9 +29,12 @@ or Lightricks/LTX-2.3/ltx-2.3-22b-distilled.safetensors) to the modular director
         └── model.safetensors
 
 Usage:
-    # From HF repo ID
+    # From HF repo ID (downloads if not cached)
     python -m mlx_video.models.ltx_2.convert --source Lightricks/LTX-2 --output LTX-2-distilled --variant distilled
     python -m mlx_video.models.ltx_2.convert --source Lightricks/LTX-2.3 --output LTX-2.3-distilled --variant distilled
+
+    # From HF repo ID using only local cache (no network)
+    python -m mlx_video.models.ltx_2.convert --source Lightricks/LTX-2.3 --output LTX-2.3-distilled --variant distilled --cached-only
 
     # From local folder containing the monolithic safetensors
     python -m mlx_video.models.ltx_2.convert --source ./Lightricks-LTX-2/ --output LTX-2-distilled --variant distilled
@@ -42,12 +45,21 @@ Usage:
 
 import argparse
 import json
-import re
 import shutil
 from pathlib import Path
 from typing import Dict
 
 import mlx.core as mx
+
+from mlx_video.models.ltx_2.checkpoint import (
+    MONOLITHIC_PATTERN,
+    UPSCALER_PATTERN,
+    find_cached_hf_snapshot,
+    read_embedded_config,
+    resolve_source,
+)
+
+GEMMA_REPO_ID = "google/gemma-3-12b-it"
 
 # ─── Key prefix routing ──────────────────────────────────────────────────────
 
@@ -77,7 +89,7 @@ def sanitize_transformer(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         if "audio_embeddings_connector" in key or "video_embeddings_connector" in key:
             continue
 
-        new_key = key[len(TRANSFORMER_PREFIX) :]
+        new_key = key[len(TRANSFORMER_PREFIX):]
         new_key = new_key.replace(".to_out.0.", ".to_out.")
         new_key = new_key.replace(".ff.net.0.proj.", ".ff.proj_in.")
         new_key = new_key.replace(".ff.net.2.", ".ff.proj_out.")
@@ -108,7 +120,7 @@ def sanitize_vae_decoder(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
             else:
                 continue
         elif key.startswith(VAE_DECODER_PREFIX):
-            new_key = key[len(VAE_DECODER_PREFIX) :]
+            new_key = key[len(VAE_DECODER_PREFIX):]
         else:
             continue
 
@@ -146,7 +158,7 @@ def sanitize_vae_encoder(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
             if value.dtype != mx.float32:
                 value = value.astype(mx.float32)
         elif key.startswith(VAE_ENCODER_PREFIX):
-            new_key = key[len(VAE_ENCODER_PREFIX) :]
+            new_key = key[len(VAE_ENCODER_PREFIX):]
         else:
             continue
 
@@ -169,7 +181,7 @@ def sanitize_audio_decoder(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         new_key = None
 
         if key.startswith(AUDIO_DECODER_PREFIX):
-            new_key = key[len(AUDIO_DECODER_PREFIX) :]
+            new_key = key[len(AUDIO_DECODER_PREFIX):]
         elif key.startswith(AUDIO_STATS_PREFIX):
             if "mean-of-means" in key:
                 new_key = "per_channel_statistics.mean_of_means"
@@ -195,7 +207,7 @@ def sanitize_audio_encoder(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         new_key = None
 
         if key.startswith(AUDIO_ENCODER_PREFIX):
-            new_key = key[len(AUDIO_ENCODER_PREFIX) :]
+            new_key = key[len(AUDIO_ENCODER_PREFIX):]
         elif key.startswith(AUDIO_STATS_PREFIX):
             if "mean-of-means" in key:
                 new_key = "per_channel_statistics.mean_of_means"
@@ -225,7 +237,7 @@ def sanitize_vocoder(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         if not key.startswith(VOCODER_PREFIX):
             continue
 
-        new_key = key[len(VOCODER_PREFIX) :]
+        new_key = key[len(VOCODER_PREFIX):]
 
         # Handle Conv1d/ConvTranspose1d weight shape conversion
         if "weight" in new_key and value.ndim == 3:
@@ -259,20 +271,20 @@ def extract_text_projections(weights: Dict[str, mx.array]) -> Dict[str, mx.array
     # aggregate_embed weights (text_embedding_projection.*)
     for key, value in weights.items():
         if key.startswith(TEXT_PROJ_PREFIX):
-            new_key = key[len(TEXT_PROJ_PREFIX) :]
+            new_key = key[len(TEXT_PROJ_PREFIX):]
             extracted[new_key] = value
 
     # video_embeddings_connector
     for key, value in weights.items():
         if key.startswith(VIDEO_CONNECTOR_PREFIX):
-            suffix = key[len(VIDEO_CONNECTOR_PREFIX) :]
+            suffix = key[len(VIDEO_CONNECTOR_PREFIX):]
             new_key = "video_embeddings_connector." + sanitize_connector_key(suffix)
             extracted[new_key] = value
 
     # audio_embeddings_connector
     for key, value in weights.items():
         if key.startswith(AUDIO_CONNECTOR_PREFIX):
-            suffix = key[len(AUDIO_CONNECTOR_PREFIX) :]
+            suffix = key[len(AUDIO_CONNECTOR_PREFIX):]
             new_key = "audio_embeddings_connector." + sanitize_connector_key(suffix)
             extracted[new_key] = value
 
@@ -365,139 +377,41 @@ def save_config(config: dict, output_dir: Path):
         f.write("\n")
 
 
-# ─── Source resolution ─────────────────────────────────────────────────────────
-
-# Matches monolithic model files: ltx-2-19b-distilled.safetensors, ltx-2.3-22b-dev.safetensors, etc.
-MONOLITHIC_PATTERN = re.compile(
-    r"^ltx-[\d.]+-\d+b-(?P<variant>distilled|dev)\.safetensors$"
-)
-
-# Matches upscaler files like ltx-2-spatial-upscaler-x2-1.0.safetensors,
-# ltx-2.3-spatial-upscaler-x2-1.0.safetensors, etc.
-UPSCALER_PATTERN = re.compile(
-    r"^ltx-[\d.]+-(?:spatial|temporal)-upscaler-.+\.safetensors$"
-)
-
-
-def resolve_source(source: str, variant: str) -> Path:
-    """Resolve source to a monolithic safetensors file path.
-
-    Args:
-        source: HF repo ID (e.g. "Lightricks/LTX-2"), local directory, or direct file path.
-        variant: Model variant ("distilled" or "dev") to select the right file.
-
-    Returns:
-        Path to the monolithic safetensors file.
-    """
-    source_path = Path(source)
-
-    # Direct file path
-    if source_path.is_file():
-        return source_path
-
-    # Local directory — find the variant's safetensors file
-    if source_path.is_dir():
-        matches = []
-        for f in sorted(source_path.glob("ltx-*b-*.safetensors")):
-            m = MONOLITHIC_PATTERN.match(f.name)
-            if m and m.group("variant") == variant:
-                matches.append(f)
-
-        if matches:
-            return matches[0]
-
-        # Broader fallback
-        all_mono = sorted(source_path.glob("ltx-*.safetensors"))
-        for f in all_mono:
-            if variant in f.name and MONOLITHIC_PATTERN.match(f.name):
-                return f
-
-        raise FileNotFoundError(
-            f"No monolithic *-{variant}.safetensors found in {source_path}. "
-            f"Files found: {[f.name for f in all_mono]}"
-        )
-
-    # HF repo ID — download via huggingface_hub
-    if "/" in source and not source_path.exists():
-        from huggingface_hub import hf_hub_download, list_repo_files
-
-        # Find the right file in the repo
-        repo_files = list_repo_files(source)
-        target = None
-        for f in repo_files:
-            m = MONOLITHIC_PATTERN.match(f)
-            if m and m.group("variant") == variant:
-                target = f
-                break
-
-        if not target:
-            raise FileNotFoundError(
-                f"No *-{variant}.safetensors found in {source}. "
-                f"Available: {[f for f in repo_files if f.endswith('.safetensors')]}"
-            )
-
-        print(f"Downloading {target} from {source}...")
-        local_path = hf_hub_download(repo_id=source, filename=target)
-        return Path(local_path)
-
-    raise FileNotFoundError(
-        f"Source not found: {source}. Provide an HF repo ID, local directory, or file path."
-    )
-
-
 # ─── Config inference ─────────────────────────────────────────────────────────
 
 
-def infer_transformer_config(weights: Dict[str, mx.array]) -> dict:
-    """Infer transformer config from weight shapes."""
-    # Count transformer layers
-    max_layer = -1
-    for key in weights:
-        if "transformer_blocks." in key:
-            parts = key.split(".")
-            try:
-                idx = parts.index("transformer_blocks") + 1
-                if idx < len(parts) and parts[idx].isdigit():
-                    max_layer = max(max_layer, int(parts[idx]))
-            except ValueError:
-                pass
-    num_layers = max_layer + 1 if max_layer >= 0 else 48
+def infer_transformer_config(weights: Dict[str, mx.array], embedded: dict) -> dict:
+    """Infer transformer config from embedded checkpoint config and weight keys."""
+    tcfg = embedded.get("transformer", {})
 
-    # Detect cross_attention_dim from attn2.to_k (cross-attention input dim)
-    cross_attention_dim = 4096
-    for key, value in weights.items():
-        if "transformer_blocks.0.attn2.to_k.weight" in key:
-            cross_attention_dim = value.shape[-1]
-            break
-
-    # Check for prompt_adaln_single (LTX-2.3 feature)
+    # has_prompt_adaln is not in the embedded config — detect from weight keys
     has_prompt_adaln = any("prompt_adaln_single" in k for k in weights)
 
     config = {
-        "attention_head_dim": 128,
-        "attention_type": "default",
-        "audio_attention_head_dim": 64,
-        "audio_caption_channels": 3840,
-        "audio_cross_attention_dim": 2048,
-        "audio_in_channels": 128,
-        "audio_num_attention_heads": 32,
-        "audio_out_channels": 128,
-        "audio_positional_embedding_max_pos": [20],
-        "av_ca_timestep_scale_multiplier": 1000,
-        "caption_channels": 3840,
-        "cross_attention_dim": cross_attention_dim,
-        "double_precision_rope": True,
-        "in_channels": 128,
         "model_type": "ltx av model",
-        "norm_eps": 1e-06,
-        "num_attention_heads": 32,
-        "num_layers": num_layers,
-        "out_channels": 128,
-        "positional_embedding_max_pos": [20, 2048, 2048],
-        "positional_embedding_theta": 10000.0,
-        "rope_type": "split",
-        "timestep_scale_multiplier": 1000,
-        "use_middle_indices_grid": True,
+        "num_attention_heads": tcfg.get("num_attention_heads", 32),
+        "attention_head_dim": tcfg.get("attention_head_dim", 128),
+        "in_channels": tcfg.get("in_channels", 128),
+        "out_channels": tcfg.get("out_channels", 128),
+        "num_layers": tcfg.get("num_layers", 48),
+        "cross_attention_dim": tcfg.get("cross_attention_dim", 4096),
+        "caption_channels": tcfg.get("caption_channels", 3840),
+        "audio_num_attention_heads": tcfg.get("audio_num_attention_heads", 32),
+        "audio_attention_head_dim": tcfg.get("audio_attention_head_dim", 64),
+        "audio_in_channels": 128,  # not in embedded; constant across versions
+        "audio_out_channels": tcfg.get("audio_out_channels", 128),
+        "audio_cross_attention_dim": tcfg.get("audio_cross_attention_dim", 2048),
+        "audio_caption_channels": tcfg.get("caption_channels", 3840),
+        "positional_embedding_theta": tcfg.get("positional_embedding_theta", 10000.0),
+        "positional_embedding_max_pos": tcfg.get("positional_embedding_max_pos", [20, 2048, 2048]),
+        "audio_positional_embedding_max_pos": tcfg.get("audio_positional_embedding_max_pos", [20]),
+        "use_middle_indices_grid": tcfg.get("use_middle_indices_grid", True),
+        "rope_type": tcfg.get("rope_type", "split"),
+        "double_precision_rope": tcfg.get("frequencies_precision") == "float64",
+        "timestep_scale_multiplier": tcfg.get("timestep_scale_multiplier", 1000),
+        "av_ca_timestep_scale_multiplier": int(tcfg.get("av_ca_timestep_scale_multiplier", 1000)),
+        "norm_eps": tcfg.get("norm_eps", 1e-6),
+        "attention_type": tcfg.get("attention_type", "default"),
     }
 
     if has_prompt_adaln:
@@ -506,147 +420,143 @@ def infer_transformer_config(weights: Dict[str, mx.array]) -> dict:
     return config
 
 
-def infer_vae_decoder_config(weights: Dict[str, mx.array], variant: str) -> dict:
-    """Infer VAE decoder config from weights."""
-    # Check for timestep conditioning keys
-    has_timestep = any(
-        "last_time_embedder" in k or "last_scale_shift_table" in k for k in weights
-    )
-
-    # Count channel multipliers from up_blocks
-    max_block = -1
-    for key in weights:
-        if "up_blocks." in key:
-            parts = key.split(".")
-            try:
-                idx = parts.index("up_blocks") + 1
-                if idx < len(parts) and parts[idx].isdigit():
-                    max_block = max(max_block, int(parts[idx]))
-            except ValueError:
-                pass
-
-    # Default config
-    config = {
+def infer_vae_decoder_config(embedded: dict) -> dict:
+    """Infer VAE decoder config from embedded checkpoint config."""
+    vcfg = embedded.get("vae", {})
+    return {
         "ch": 128,
         "ch_mult": [1, 2, 4],
         "dropout": 0.0,
         "num_res_blocks": 2,
         "out_ch": 2,
         "resolution": 256,
-        "timestep_conditioning": has_timestep,
+        "spatial_padding_mode": vcfg.get("spatial_padding_mode", "zeros"),
+        "timestep_conditioning": vcfg.get("timestep_conditioning", False),
         "z_channels": 8,
     }
-    return config
 
 
-def infer_vae_encoder_config(weights: Dict[str, mx.array]) -> dict:
-    """Return VAE encoder config (architecture is consistent across versions)."""
+def infer_vae_encoder_config(embedded: dict) -> dict:
+    """Infer VAE encoder config from embedded checkpoint config."""
+    vcfg = embedded.get("vae", {})
+    encoder_blocks = vcfg.get("encoder_blocks", [
+        ["res_x", {"num_layers": 4}],
+        ["compress_space_res", {"multiplier": 2}],
+        ["res_x", {"num_layers": 6}],
+        ["compress_time_res", {"multiplier": 2}],
+        ["res_x", {"num_layers": 6}],
+        ["compress_all_res", {"multiplier": 2}],
+        ["res_x", {"num_layers": 2}],
+        ["compress_all_res", {"multiplier": 2}],
+        ["res_x", {"num_layers": 2}],
+    ])
     return {
-        "convolution_dimensions": 3,
-        "encoder_blocks": [
-            ["res_x", {"num_layers": 4}],
-            ["compress_space_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_time_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-        ],
-        "encoder_spatial_padding_mode": "zeros",
-        "in_channels": 3,
-        "latent_log_var": "uniform",
-        "norm_layer": "pixel_norm",
-        "out_channels": 128,
-        "patch_size": 4,
+        "convolution_dimensions": vcfg.get("dims", 3),
+        "encoder_blocks": encoder_blocks,
+        "encoder_spatial_padding_mode": vcfg.get("spatial_padding_mode", "zeros"),
+        "in_channels": vcfg.get("in_channels", 3),
+        "latent_log_var": vcfg.get("latent_log_var", "uniform"),
+        "norm_layer": vcfg.get("norm_layer", "pixel_norm"),
+        "out_channels": vcfg.get("latent_channels", 128),
+        "patch_size": vcfg.get("patch_size", 4),
     }
 
 
-def infer_audio_vae_config(weights: Dict[str, mx.array]) -> dict:
-    """Return audio VAE config."""
+def infer_audio_vae_config(embedded: dict) -> dict:
+    """Infer audio VAE decoder config from embedded checkpoint config."""
+    avae = embedded.get("audio_vae", {})
+    ddconfig = avae.get("model", {}).get("params", {}).get("ddconfig", {})
+    stft = avae.get("preprocessing", {}).get("stft", {})
+    sampling_rate = avae.get("model", {}).get("params", {}).get("sampling_rate", 16000)
+
     return {
-        "attn_resolutions": [],
+        "attn_resolutions": ddconfig.get("attn_resolutions", []),
         "attn_type": "vanilla",
-        "causality_axis": "height",
-        "ch": 128,
-        "ch_mult": [1, 2, 4],
-        "dropout": 0.0,
+        "causality_axis": ddconfig.get("causality_axis", "height"),
+        "ch": ddconfig.get("ch", 128),
+        "ch_mult": ddconfig.get("ch_mult", [1, 2, 4]),
+        "dropout": ddconfig.get("dropout", 0.0),
         "give_pre_end": False,
-        "is_causal": True,
-        "mel_bins": 64,
-        "mel_hop_length": 160,
-        "mid_block_add_attention": False,
-        "norm_type": "pixel",
-        "num_res_blocks": 2,
-        "out_ch": 2,
+        "is_causal": stft.get("causal", True),
+        "mel_bins": ddconfig.get("mel_bins", 64),
+        "mel_hop_length": stft.get("hop_length", 160),
+        "mid_block_add_attention": ddconfig.get("mid_block_add_attention", False),
+        "norm_type": ddconfig.get("norm_type", "pixel"),
+        "num_res_blocks": ddconfig.get("num_res_blocks", 2),
+        "out_ch": ddconfig.get("out_ch", 2),
         "resamp_with_conv": True,
-        "resolution": 256,
-        "sample_rate": 16000,
+        "resolution": ddconfig.get("resolution", 256),
+        "sample_rate": sampling_rate,
         "tanh_out": False,
-        "z_channels": 8,
+        "z_channels": ddconfig.get("z_channels", 8),
     }
 
 
-def infer_audio_encoder_config(weights: Dict[str, mx.array]) -> dict:
-    """Return audio encoder config (mirrors decoder but with encoder-specific fields)."""
+def infer_audio_encoder_config(embedded: dict) -> dict:
+    """Infer audio VAE encoder config from embedded checkpoint config."""
+    avae = embedded.get("audio_vae", {})
+    ddconfig = avae.get("model", {}).get("params", {}).get("ddconfig", {})
+    stft = avae.get("preprocessing", {}).get("stft", {})
+    sampling_rate = avae.get("model", {}).get("params", {}).get("sampling_rate", 16000)
+
     return {
-        "attn_resolutions": [],
+        "attn_resolutions": ddconfig.get("attn_resolutions", []),
         "attn_type": "vanilla",
-        "causality_axis": "height",
-        "ch": 128,
-        "ch_mult": [1, 2, 4],
-        "dropout": 0.0,
-        "in_channels": 2,
-        "double_z": True,
-        "is_causal": True,
-        "mel_bins": 64,
-        "mel_hop_length": 160,
-        "mid_block_add_attention": False,
-        "n_fft": 1024,
-        "norm_type": "pixel",
-        "num_res_blocks": 2,
+        "causality_axis": ddconfig.get("causality_axis", "height"),
+        "ch": ddconfig.get("ch", 128),
+        "ch_mult": ddconfig.get("ch_mult", [1, 2, 4]),
+        "double_z": ddconfig.get("double_z", True),
+        "dropout": ddconfig.get("dropout", 0.0),
+        "in_channels": ddconfig.get("in_channels", 2),
+        "is_causal": stft.get("causal", True),
+        "mel_bins": ddconfig.get("mel_bins", 64),
+        "mel_hop_length": stft.get("hop_length", 160),
+        "mid_block_add_attention": ddconfig.get("mid_block_add_attention", False),
+        "n_fft": stft.get("filter_length", 1024),
+        "norm_type": ddconfig.get("norm_type", "pixel"),
+        "num_res_blocks": ddconfig.get("num_res_blocks", 2),
         "resamp_with_conv": True,
-        "resolution": 256,
-        "sample_rate": 16000,
-        "z_channels": 8,
+        "resolution": ddconfig.get("resolution", 256),
+        "sample_rate": sampling_rate,
+        "z_channels": ddconfig.get("z_channels", 8),
     }
 
 
-def infer_vocoder_config(weights: Dict[str, mx.array]) -> dict:
-    """Infer vocoder config from weights."""
-    # Check for bwe_generator (LTX-2.3 BigVGAN vocoder)
-    has_bwe = any(k.startswith("bwe_generator") for k in weights)
+def infer_vocoder_config(embedded: dict) -> dict:
+    """Infer vocoder config from embedded checkpoint config."""
+    vcfg = embedded.get("vocoder", {})
 
-    if has_bwe:
+    if "vocoder" in vcfg:
+        # LTX-2.3 BigVGAN: nested vocoder + bwe sub-configs
+        vocoder_sub = dict(vcfg["vocoder"])
+        vocoder_sub.setdefault("output_sample_rate", 16000)
         return {
             "type": "bigvgan",
             "has_bwe_generator": True,
+            "vocoder": vocoder_sub,
+            "bwe": dict(vcfg["bwe"]),
         }
 
-    return {
-        "output_sample_rate": 24000,
-        "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-        "resblock_kernel_sizes": [3, 7, 11],
-        "stereo": True,
-        "upsample_initial_channel": 1024,
-        "upsample_kernel_sizes": [16, 15, 8, 4, 4],
-        "upsample_rates": [6, 5, 2, 2, 2],
-    }
+    # LTX-2 HiFi-GAN: flat config, add output_sample_rate (not stored in embedded)
+    result = dict(vcfg)
+    result.setdefault("output_sample_rate", 24000)
+    return result
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
-def convert(source: str, output_path: Path, variant: str = "distilled"):
+def convert(source: str, output_path: Path, variant: str = "distilled", cached_only: bool = False):
     """Convert monolithic safetensors to modular directory layout.
 
     Args:
         source: HF repo ID (e.g. "Lightricks/LTX-2"), local directory, or file path.
         output_path: Output directory for the modular layout.
         variant: "distilled" or "dev".
+        cached_only: If True, never trigger network downloads — use local files and HF cache only.
     """
-    source_path = resolve_source(source, variant)
+    source_path = resolve_source(source, variant, local_files_only=cached_only)
+    embedded = read_embedded_config(source_path)
 
     print(f"Loading monolithic weights from {source_path.name}...")
     all_weights = mx.load(str(source_path))
@@ -660,18 +570,16 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     print("  [1/7] Transformer...")
     transformer_weights = sanitize_transformer(all_weights)
     num_shards = save_sharded(transformer_weights, output_path / "transformer")
-    config = infer_transformer_config(transformer_weights)
+    config = infer_transformer_config(transformer_weights, embedded)
     save_config(config, output_path / "transformer")
     t_params = sum(v.size for v in transformer_weights.values())
-    print(
-        f"    {len(transformer_weights)} keys, {t_params:,} params, {num_shards} shards"
-    )
+    print(f"    {len(transformer_weights)} keys, {t_params:,} params, {num_shards} shards")
 
     # 2. VAE Decoder
     print("  [2/7] VAE Decoder...")
     vae_decoder_weights = sanitize_vae_decoder(all_weights)
     save_single(vae_decoder_weights, output_path / "vae" / "decoder")
-    config = infer_vae_decoder_config(vae_decoder_weights, variant)
+    config = infer_vae_decoder_config(embedded)
     save_config(config, output_path / "vae" / "decoder")
     d_params = sum(v.size for v in vae_decoder_weights.values())
     print(f"    {len(vae_decoder_weights)} keys, {d_params:,} params")
@@ -680,7 +588,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     print("  [3/7] VAE Encoder...")
     vae_encoder_weights = sanitize_vae_encoder(all_weights)
     save_single(vae_encoder_weights, output_path / "vae" / "encoder")
-    config = infer_vae_encoder_config(vae_encoder_weights)
+    config = infer_vae_encoder_config(embedded)
     save_config(config, output_path / "vae" / "encoder")
     e_params = sum(v.size for v in vae_encoder_weights.values())
     print(f"    {len(vae_encoder_weights)} keys, {e_params:,} params")
@@ -689,7 +597,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     print("  [4/7] Audio VAE Decoder...")
     audio_decoder_weights = sanitize_audio_decoder(all_weights)
     save_single(audio_decoder_weights, output_path / "audio_vae" / "decoder")
-    config = infer_audio_vae_config(audio_decoder_weights)
+    config = infer_audio_vae_config(embedded)
     save_config(config, output_path / "audio_vae" / "decoder")
     a_params = sum(v.size for v in audio_decoder_weights.values())
     print(f"    {len(audio_decoder_weights)} keys, {a_params:,} params")
@@ -698,7 +606,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     print("  [5/7] Audio VAE Encoder...")
     audio_encoder_weights = sanitize_audio_encoder(all_weights)
     save_single(audio_encoder_weights, output_path / "audio_vae" / "encoder")
-    config = infer_audio_encoder_config(audio_encoder_weights)
+    config = infer_audio_encoder_config(embedded)
     save_config(config, output_path / "audio_vae" / "encoder")
     ae_params = sum(v.size for v in audio_encoder_weights.values())
     print(f"    {len(audio_encoder_weights)} keys, {ae_params:,} params")
@@ -707,7 +615,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     print("  [6/7] Vocoder...")
     vocoder_weights = sanitize_vocoder(all_weights)
     save_single(vocoder_weights, output_path / "vocoder")
-    config = infer_vocoder_config(vocoder_weights)
+    config = infer_vocoder_config(embedded)
     save_config(config, output_path / "vocoder")
     v_params = sum(v.size for v in vocoder_weights.values())
     print(f"    {len(vocoder_weights)} keys, {v_params:,} params")
@@ -727,7 +635,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
     is_hf_repo = "/" in source and not Path(source).exists()
     upscaler_files = []
 
-    if is_hf_repo:
+    if is_hf_repo and not cached_only:
         from huggingface_hub import list_repo_files
 
         upscaler_files = [
@@ -753,7 +661,7 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
         if local_candidate.is_file():
             shutil.copy2(str(local_candidate), str(dest))
             print(f"  {upscaler_file}: copied")
-        elif is_hf_repo:
+        elif is_hf_repo and not cached_only:
             from huggingface_hub import hf_hub_download
 
             print(f"  {upscaler_file}: downloading from {source}...")
@@ -773,14 +681,12 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
 
         local_candidate = source_dir / subdir
         if local_candidate.is_dir():
-            # Resolve through symlinks to get the real directory
             real_path = local_candidate.resolve()
             dest.symlink_to(real_path)
             print(f"  {subdir}/: symlinked to {real_path}")
-        elif is_hf_repo:
+        elif is_hf_repo and not cached_only:
             from huggingface_hub import list_repo_files, snapshot_download
 
-            # Only download if the subdir exists in the repo
             repo_files = list_repo_files(source)
             if any(f.startswith(f"{subdir}/") for f in repo_files):
                 print(f"  {subdir}/: downloading from {source}...")
@@ -790,10 +696,21 @@ def convert(source: str, output_path: Path, variant: str = "distilled"):
                     local_dir=str(output_path),
                 )
                 print(f"  {subdir}/: done")
-            else:
-                print(f"  {subdir}/: not in repo, skipping")
+                continue
+            # Source repo has no text_encoder — fall through to Gemma cache
+
+        # Try local HF cache for Gemma (covers: local source, cached_only, or no subdir in repo)
+        gemma_snapshot = find_cached_hf_snapshot(GEMMA_REPO_ID)
+        if gemma_snapshot and (Path(gemma_snapshot) / subdir).is_dir():
+            real_path = (Path(gemma_snapshot) / subdir).resolve()
+            dest.symlink_to(real_path)
+            print(f"  {subdir}/: symlinked to {real_path} (from {GEMMA_REPO_ID} cache)")
+        elif gemma_snapshot:
+            # Gemma stores tokenizer files and model files at snapshot root, no subdirs
+            dest.symlink_to(Path(gemma_snapshot).resolve())
+            print(f"  {subdir}/: symlinked to {gemma_snapshot} (from {GEMMA_REPO_ID} cache)")
         else:
-            print(f"  {subdir}/: not found in source, skipping")
+            print(f"  {subdir}/: not found, skipping (will be resolved at runtime)")
 
     # Summary
     all_converted = (
@@ -852,6 +769,12 @@ if __name__ == "__main__":
         default="distilled",
         help="Model variant (affects VAE decoder config and which file to download)",
     )
+    parser.add_argument(
+        "--cached-only",
+        action="store_true",
+        default=False,
+        help="Never trigger network downloads — use only locally cached files",
+    )
     args = parser.parse_args()
 
-    convert(args.source, Path(args.output), variant=args.variant)
+    convert(args.source, Path(args.output), variant=args.variant, cached_only=args.cached_only)

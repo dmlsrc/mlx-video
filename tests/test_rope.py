@@ -456,42 +456,39 @@ class TestRoPEInputCasting:
 
 
 class TestDoublePrecisionRopeConfig:
-    """Tests for the conditional double_precision_rope logic in LTXModelConfig."""
+    """Tests for double_precision_rope in LTXModelConfig.
 
-    def test_ltx2_forces_double_precision_rope_false(self):
-        """LTX-2 (no prompt adaln) must have double_precision_rope=False."""
+    Both LTX-2 and LTX-2.3 checkpoints embed frequencies_precision="float64",
+    so double_precision_rope is respected as-is for both models.
+    """
+
+    def test_ltx2_preserves_double_precision_rope_true(self):
+        """LTX-2 checkpoint sets frequencies_precision=float64, so True must be preserved."""
         config = LTXModelConfig(has_prompt_adaln=False, double_precision_rope=True)
-        assert (
-            config.double_precision_rope is False
-        ), "LTX-2 should force double_precision_rope=False regardless of input"
+        assert config.double_precision_rope is True
+
+    def test_ltx2_preserves_double_precision_rope_false(self):
+        """False must also be preserved (e.g. user override)."""
+        config = LTXModelConfig(has_prompt_adaln=False, double_precision_rope=False)
+        assert config.double_precision_rope is False
 
     def test_ltx23_preserves_double_precision_rope_true(self):
-        """LTX-2.3 (has_prompt_adaln=True) should keep double_precision_rope=True."""
+        """LTX-2.3 with double_precision_rope=True should stay True."""
         config = LTXModelConfig(has_prompt_adaln=True, double_precision_rope=True)
-        assert (
-            config.double_precision_rope is True
-        ), "LTX-2.3 should preserve double_precision_rope=True"
+        assert config.double_precision_rope is True
 
     def test_ltx23_preserves_double_precision_rope_false(self):
         """LTX-2.3 with double_precision_rope=False should stay False."""
         config = LTXModelConfig(has_prompt_adaln=True, double_precision_rope=False)
-        assert (
-            config.double_precision_rope is False
-        ), "LTX-2.3 should respect double_precision_rope=False when explicitly set"
-
-    def test_ltx2_default_double_precision_rope(self):
-        """LTX-2 default (double_precision_rope not set) should be False."""
-        config = LTXModelConfig(has_prompt_adaln=False)
         assert config.double_precision_rope is False
 
-    def test_ltx23_default_double_precision_rope(self):
-        """LTX-2.3 default (double_precision_rope not set) should be False (field default)."""
-        config = LTXModelConfig(has_prompt_adaln=True)
-        # The field default is False and __post_init__ doesn't override for LTX-2.3
+    def test_default_double_precision_rope(self):
+        """Default value is False when not specified."""
+        config = LTXModelConfig()
         assert config.double_precision_rope is False
 
     def test_config_from_dict_ltx2(self):
-        """Config created from dict for LTX-2 should force double_precision_rope=False."""
+        """Config from dict for LTX-2 preserves double_precision_rope=True."""
         config = LTXModelConfig.from_dict(
             {
                 "has_prompt_adaln": False,
@@ -499,10 +496,10 @@ class TestDoublePrecisionRopeConfig:
                 "rope_type": "split",
             }
         )
-        assert config.double_precision_rope is False
+        assert config.double_precision_rope is True
 
     def test_config_from_dict_ltx23(self):
-        """Config created from dict for LTX-2.3 should preserve double_precision_rope."""
+        """Config from dict for LTX-2.3 preserves double_precision_rope=True."""
         config = LTXModelConfig.from_dict(
             {
                 "has_prompt_adaln": True,

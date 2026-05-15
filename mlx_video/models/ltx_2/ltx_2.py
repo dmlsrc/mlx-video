@@ -238,7 +238,7 @@ class MultiModalTransformerArgsPreprocessor:
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
+    def prepare(self, modality: Modality, cross_modality: Optional[Modality] = None) -> TransformerArgs:
         from dataclasses import replace
 
         transformer_args = self.simple_preprocessor.prepare(modality)
@@ -252,10 +252,19 @@ class MultiModalTransformerArgsPreprocessor:
             num_attention_heads=self.simple_preprocessor.num_attention_heads,
         )
 
+        # Use cross modality sigma for AV cross-attention timestep conditioning.
+        # Reference (Lightricks, Diffusers) conditions video cross-attn on audio sigma
+        # and audio cross-attn on video sigma. Falls back to own timesteps if no
+        # cross modality is provided (e.g. video-only inference).
+        if cross_modality is not None and cross_modality.sigma is not None:
+            cross_timestep = cross_modality.sigma.reshape(-1, 1)
+        else:
+            cross_timestep = modality.timesteps
+
         # Prepare cross-attention timestep embeddings
         cross_scale_shift_timestep, cross_gate_timestep = (
             self._prepare_cross_attention_timestep(
-                timestep=modality.timesteps,
+                timestep=cross_timestep,
                 timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
                 batch_size=transformer_args.x.shape[0],
                 hidden_dtype=transformer_args.x.dtype,
@@ -586,10 +595,10 @@ class LTXModel(nn.Module):
 
         # Preprocess arguments
         video_args = (
-            self.video_args_preprocessor.prepare(video) if video is not None else None
+            self.video_args_preprocessor.prepare(video, cross_modality=audio) if video is not None else None
         )
         audio_args = (
-            self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+            self.audio_args_preprocessor.prepare(audio, cross_modality=video) if audio is not None else None
         )
 
         # Process transformer blocks
