@@ -5,7 +5,9 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 
 import argparse
 import math
+import os
 import re
+import sys
 import time
 from enum import Enum
 from pathlib import Path
@@ -467,6 +469,62 @@ def compute_audio_frames(num_video_frames: int, fps: float) -> int:
 # =============================================================================
 
 
+# =============================================================================
+# Profiling helpers — mirror LTX-2-MLX's hooks so traces are apples-to-apples.
+# Both are env-gated; zero cost when unset.
+#
+#   LTX_PROFILE_PAUSE_BEFORE_DENOISE=1
+#       Block on stdin once, immediately before the first denoise loop.
+#       Attach Instruments to the running pid after model load / prompt
+#       encoding so the trace doesn't include Gemma / VAE / setup work.
+#       The module-level guard makes this fire only on the first denoise
+#       call (e.g. stage 1 of distilled two-stage), never on subsequent
+#       calls within the same process.
+#
+#   LTX_PROFILE_STOP_AFTER_STEPS=N
+#       Exit cleanly after step N of the current denoise loop.
+#       N=2 gives one warmup step + one steady-state step — the minimum
+#       useful capture window for kernel-mix analysis.
+# =============================================================================
+
+_profile_paused = False
+
+
+def _profile_pause_before_denoise(stage_name: str = "denoise") -> None:
+    global _profile_paused
+    if _profile_paused:
+        return
+    if not os.environ.get("LTX_PROFILE_PAUSE_BEFORE_DENOISE"):
+        return
+    _profile_paused = True
+    print(
+        f"\n  [LTX_PROFILE_PAUSE_BEFORE_DENOISE] pid={os.getpid()}  "
+        f"attach Instruments now, then press Enter to start {stage_name}.",
+        flush=True,
+    )
+    try:
+        input()
+    except EOFError:
+        pass
+
+
+def _profile_stop_after_steps(step_idx: int, num_steps: int) -> None:
+    stop_n_str = os.environ.get("LTX_PROFILE_STOP_AFTER_STEPS")
+    if not stop_n_str:
+        return
+    try:
+        stop_n = int(stop_n_str)
+    except ValueError:
+        return
+    if stop_n > 0 and (step_idx + 1) >= stop_n:
+        print(
+            f"\n  [LTX_PROFILE_STOP_AFTER_STEPS={stop_n}] "
+            f"completed step {step_idx + 1}/{num_steps}, exiting.",
+            flush=True,
+        )
+        sys.exit(0)
+
+
 def denoise_distilled(
     latents: mx.array,
     positions: mx.array,
@@ -505,6 +563,8 @@ def denoise_distilled(
         disable=not verbose,
     ) as progress:
         task = progress.add_task(desc, total=num_steps)
+
+        _profile_pause_before_denoise("distilled denoise")
 
         for i in range(num_steps):
             step_t0 = time.perf_counter()  # PERF DIAG — strip after measurement
@@ -619,6 +679,7 @@ def denoise_distilled(
             )
 
             progress.advance(task)
+            _profile_stop_after_steps(i, num_steps)
 
     return latents.astype(dtype), audio_latents.astype(dtype) if enable_audio else None
 
@@ -702,6 +763,8 @@ def denoise_dev(
             passes.append("STG")
         label = "+".join(passes) if passes else "uncond"
         task = progress.add_task(f"[cyan]Denoising ({label})[/]", total=num_steps)
+
+        _profile_pause_before_denoise("dev denoise")
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -829,6 +892,7 @@ def denoise_dev(
 
             mx.eval(latents)
             progress.advance(task)
+            _profile_stop_after_steps(i, num_steps)
 
     return latents.astype(dtype)
 
@@ -929,6 +993,8 @@ def denoise_dev_av(
             passes.append("Mod")
         label = "+".join(passes) if passes else "uncond"
         task = progress.add_task(f"[cyan]Denoising A/V ({label})[/]", total=num_steps)
+
+        _profile_pause_before_denoise("dev A/V denoise")
 
         for i in range(num_steps):
             sigma = sigmas_list[i]
@@ -1176,6 +1242,7 @@ def denoise_dev_av(
 
             mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            _profile_stop_after_steps(i, num_steps)
 
     return video_latents, audio_latents
 
@@ -1488,6 +1555,8 @@ def denoise_res2s_av(
             f"[cyan]Denoising A/V ({label})[/]", total=n_full_steps
         )
 
+        _profile_pause_before_denoise("res2s A/V denoise")
+
         for step_idx in range(n_full_steps):
             sigma = sigmas_list[step_idx]
             sigma_next = sigmas_list[step_idx + 1]
@@ -1586,6 +1655,7 @@ def denoise_res2s_av(
 
             mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            _profile_stop_after_steps(step_idx, n_full_steps)
 
     # Final clean step if original schedule ended at 0
     if sigmas.tolist()[-1] == 0:
